@@ -1,0 +1,15 @@
+# 系统与编辑器
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# 临时与日志
+*.tmp
+*.log
+*.bak
+
+# 本地测试/调试产物
+test-output.json
+out.json
