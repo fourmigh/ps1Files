@@ -3,12 +3,14 @@
     自动为 OpenCode 的 plan / build 两个内置 agent 选择最省钱的模型，并写入全局配置。
 
 .DESCRIPTION
-    本脚本完成三件事：
+    本脚本完成四件事：
       1. 通过 opencode CLI 实时查询当前可用的所有模型及其最新价格（不硬编码价格）；
-      2. 按规则挑选模型：
+      2. 按规则挑选模型（先发最小请求探测实际可用性，剔除地区受限等不可用模型）：
            - Build（实现）：在付费模型里选最便宜（默认排除 0 元 Free 模型，可用 -IncludeFree 放开）；
            - Plan （规划）：接入 Artificial Analysis 的 Intelligence Index，选智能分最高的可用模型；
       3. 把结果写入全局配置 opencode.json（更新顶层 model 及 agents.plan.model / agents.build.model，其余字段保留）。
+    说明：只影响"新会话"。已有会话的模型受 opencode 桌面应用的输入框快照与历史模型锁定，无法通过脚本批量修改；
+          如需让某个老会话用新模型，请在该会话内用 /models 手动选一次。
 
     模型范围：仅取 opencode（免费）与 opencode-go（付费+免费）两个 provider，忽略 zai / zhipuai 等第三方。
 
@@ -20,6 +22,15 @@
 
 .PARAMETER IncludeFree
     Build 允许选择 0 元 Free 模型（默认排除 Free，选付费里最便宜的）。
+
+.PARAMETER RefreshAA
+    忽略 AA 数据缓存，强制重新拉取（默认当天内命中缓存直接用）。
+
+.PARAMETER RefreshAvail
+    忽略模型可用性缓存，强制重新探测所有候选模型的实际可用性。
+
+.PARAMETER NoPause
+    结束后不等待回车直接退出（供命令行/自动化使用）。默认会停在"按回车键退出"，便于双击运行时查看结果。
 
 .PARAMETER CliPath
     手动指定 opencode CLI 可执行文件的完整路径。缺省时自动探测。
@@ -42,6 +53,9 @@
 .NOTES
     - Artificial Analysis 免费 API key 在 https://artificialanalysis.ai 注册获取，
       设置为环境变量 AA_API_KEY 后即可启用 Plan 的"按智能分选最强"。
+    - 缓存文件存放在脚本目录（均为单文件、带日期、跨天自动覆盖，不会堆积）：
+        aa-models-cache.json        AA 智能分/价格数据
+        model-availability-cache.json 模型实际可用性探测结果
     - 脚本写入的配置会即时生效，无需重启 OpenCode（若未生效可执行 /reload）。
 #>
 
@@ -50,6 +64,9 @@ param(
     [switch]$ListAll,
     [switch]$DryRun,
     [switch]$IncludeFree,
+    [switch]$RefreshAA,
+    [switch]$RefreshAvail,
+    [switch]$NoPause,
     [string]$CliPath,
     [string]$AAKey
 )
@@ -64,6 +81,9 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 $Script:Providers     = @('opencode', 'opencode-go')     # 仅这两个 provider 参与选择
 $Script:AA_BaseUrl    = 'https://artificialanalysis.ai/api/v2/language/models/free'
 $Script:ConfigSchema  = 'https://opencode.ai/config.json'
+$Script:AACachePath   = Join-Path $PSScriptRoot 'aa-models-cache.json'          # AA 数据缓存
+$Script:AvailCachePath = Join-Path $PSScriptRoot 'model-availability-cache.json' # 可用性缓存
+$Script:AvailMap      = @{}   # 模型可用性内存映射（ref -> bool）
 
 # ===================== 工具函数 =====================
 
@@ -125,10 +145,30 @@ function Get-OpenCodeModels {
 
 <#
     获取 Artificial Analysis 的模型智能分与价格（免费层，翻页取全量）。
+    按天缓存到 $CachePath：同一天命中缓存直接返回，跨天或 -Refresh 时重新拉取并覆盖。
     返回 PSCustomObject 数组：slug / name / index / inputPrice / outputPrice
 #>
 function Get-AAData {
-    param([string]$Key)
+    param([string]$Key, [string]$CachePath, [switch]$Refresh)
+    $today = Get-Date -Format 'yyyy-MM-dd'
+
+    if (-not $Refresh -and (Test-Path $CachePath)) {
+        try {
+            $cache = (Get-Content $CachePath -Raw -Encoding UTF8) | ConvertFrom-Json
+            if ($cache.date -eq $today -and $cache.data -and @($cache.data).Count -gt 0) {
+                Write-Host "AA 缓存命中（$today），跳过接口调用"
+                return @($cache.data | ForEach-Object {
+                    [pscustomobject]@{
+                        slug = $_.slug; name = $_.name; index = $_.index
+                        inputPrice = $_.inputPrice; outputPrice = $_.outputPrice
+                    }
+                })
+            }
+        } catch {
+            Write-Warning "AA 缓存读取失败，重新拉取：$($_.Exception.Message)"
+        }
+    }
+
     $headers = @{ 'x-api-key' = $Key }
     $all = @()
     $page = 1
@@ -149,7 +189,82 @@ function Get-AAData {
         $hasMore = [bool]$json.pagination.has_more
         $page++
     } while ($hasMore -and $page -le $maxPage)
+
+    # 写缓存（覆盖旧文件，单文件按天）
+    try {
+        $obj = [ordered]@{ date = $today; data = $all }
+        $jsonOut = $obj | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($CachePath, $jsonOut, (New-Object System.Text.UTF8Encoding($false)))
+        Write-Host "AA 数据已缓存（$today）"
+    } catch {
+        Write-Warning "写 AA 缓存失败：$($_.Exception.Message)"
+    }
     return $all
+}
+
+<#
+    实际探测模型是否可用：发一个最小请求（--archived 让探测会话不进列表）。
+    地区受限（not available in your country）或其他报错 => 不可用($false)；正常返回 => 可用($true)。
+#>
+function Test-ModelAvailable {
+    param([string]$Cli, [string]$ModelRef)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Cli
+    $psi.Arguments = 'run --model "' + $ModelRef + '" --archived --title "probe" "Reply with OK"'
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    # 退出码非 0 视为不可用（地区限制、已废弃、鉴权失败等都会导致非 0）
+    if ($p.ExitCode -ne 0) { return $false }
+    # 双保险：即便退出码为 0，出现以下关键字也判为不可用
+    $combined = "$stdout`n$stderr"
+    if ($combined -match 'not available in your country') { return $false }
+    if ($combined -match '(?i)(deprecated|unauthor|forbidden|denied|no longer available|not supported)') { return $false }
+    return $true
+}
+
+<# 读取可用性缓存（同一天才有效），返回 ref -> bool 的映射 #>
+function Get-AvailabilityMap {
+    param([string]$CachePath)
+    $today = Get-Date -Format 'yyyy-MM-dd'
+    $map = @{}
+    if (Test-Path $CachePath) {
+        try {
+            $cache = (Get-Content $CachePath -Raw -Encoding UTF8) | ConvertFrom-Json
+            if ($cache.date -eq $today -and $cache.availability) {
+                foreach ($p in $cache.availability.PSObject.Properties) { $map[$p.Name] = [bool]$p.Value }
+            }
+        } catch { }
+    }
+    return $map
+}
+
+<# 保存可用性缓存（单文件按天覆盖） #>
+function Save-AvailabilityMap {
+    param([string]$CachePath, [hashtable]$Map)
+    $today = Get-Date -Format 'yyyy-MM-dd'
+    try {
+        $avail = [ordered]@{}
+        foreach ($k in ($Map.Keys | Sort-Object)) { $avail[$k] = $Map[$k] }
+        $obj = [ordered]@{ date = $today; availability = $avail }
+        $json = $obj | ConvertTo-Json -Depth 10
+        [System.IO.File]::WriteAllText($CachePath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        Write-Warning "写可用性缓存失败：$($_.Exception.Message)"
+    }
+}
+
+<# 带缓存的可用性判断：命中内存缓存则直接用，否则实际探测并记录 #>
+function Test-ModelAvailableCached {
+    param([string]$Cli, [string]$ModelRef)
+    if ($Script:AvailMap.ContainsKey($ModelRef)) { return $Script:AvailMap[$ModelRef] }
+    $ok = Test-ModelAvailable -Cli $Cli -ModelRef $ModelRef
+    $Script:AvailMap[$ModelRef] = $ok
+    return $ok
 }
 
 <# 写配置：更新顶层 model、agents.plan.model 与 agents.build.model，保留其余字段 #>
@@ -208,6 +323,15 @@ function Write-Config {
     }
 }
 
+
+<# 结束前暂停，便于双击运行时查看最终结果；-NoPause 可跳过 #>
+function Wait-Exit {
+    if ($NoPause) { return }
+    Write-Host ''
+    Write-Host '按回车键退出...'
+    $null = Read-Host
+}
+
 # ===================== 主流程 =====================
 try {
     # 0. 定位 CLI 与 AA key
@@ -235,7 +359,7 @@ try {
     $aaItems = @()
     if ($aaKey) {
         try {
-            $aaItems = @(Get-AAData -Key $aaKey)
+            $aaItems = @(Get-AAData -Key $aaKey -CachePath $Script:AACachePath -Refresh:$RefreshAA)
             foreach ($m in $aaItems) {
                 $key = Get-NormalizedKey -Name $m.slug
                 if ($key -and -not $aaMap.ContainsKey($key)) {
@@ -262,6 +386,7 @@ try {
         $rows += [pscustomobject]@{
             ref      = "$($m.providerID)/$($m.id)"
             provider = $m.providerID
+            modelId  = $m.id
             name     = $m.name
             input    = $input
             output   = $output
@@ -272,35 +397,59 @@ try {
         }
     }
 
-    # 5. 选择 Build（排除 Free 按综合价取最小；-IncludeFree 则允许免费）
-    $buildPool = @($rows | Where-Object { $IncludeFree -or (-not $_.isFree) })
-    if ($buildPool.Count -eq 0) { throw '没有可用于 Build 的模型。' }
-    $build = $buildPool | Sort-Object total, input | Select-Object -First 1
-
-    # 6. 选择 Plan（按智能分最高；同型号多 provider 取价格最低；无匹配则回退价格最高）
-    $plan = $null
-    $planSource = ''
-    $scored = @($rows | Where-Object { $null -ne $_.index })
-    if ($scored.Count -gt 0) {
-        $plan = $scored | Sort-Object @{ Expression = 'index'; Descending = $true }, total, input | Select-Object -First 1
-        $planSource = "AA Intelligence Index = $($plan.index)（$($plan.aaName)）"
-    }
-    if (-not $plan) {
-        $plan = $buildPool | Sort-Object total, input -Descending | Select-Object -First 1
-        $planSource = '回退：未匹配到 AA 智能分，取价格最高旗舰'
-    }
-
-    # 7. -ListAll：打印全表后退出
+    # 5. -ListAll：只打印全表（不做可用性探测，避免大量请求），退出
     if ($ListAll) {
         Write-Host ''
-        Write-Host '=== 候选模型（按综合价 input+output 升序）==='
+        Write-Host '=== 候选模型（按综合价 input+output 升序；实际可用性在正式选择时探测）==='
         $rows | Sort-Object total, input |
             Select-Object ref, name, input, output, total, @{ n = 'AA智能分'; e = { if ($null -ne $_.index) { $_.index } else { '-' } } } |
             Format-Table -AutoSize | Out-String | Write-Host
-        Write-Host "=== 选择结果 ==="
-        Write-Host "Build : $($build.ref)  综合价 $($build.total) (in $($build.input) / out $($build.output))"
-        Write-Host "Plan  : $($plan.ref)  来源: $planSource"
+        Wait-Exit
         return
+    }
+
+    # 6. 加载可用性缓存（未指定 -RefreshAvail 时，复用当天的探测结果）
+    if (-not $RefreshAvail) {
+        $Script:AvailMap = Get-AvailabilityMap -CachePath $Script:AvailCachePath
+        if ($Script:AvailMap.Count -gt 0) { Write-Host "可用性缓存   : $($Script:AvailMap.Count) 条（当日）" }
+    }
+
+    # 7. 选择 Build：排除 Free，按综合价升序，逐个探测实际可用性，选第一个可用的
+    $buildPool = @($rows | Where-Object { $IncludeFree -or (-not $_.isFree) } | Sort-Object total, input)
+    if ($buildPool.Count -eq 0) { throw '没有可用于 Build 的模型。' }
+    $build = $null
+    $buildProbed = 0
+    foreach ($cand in $buildPool) {
+        if ($buildProbed -ge 20) { break }
+        $buildProbed++
+        if (Test-ModelAvailableCached -Cli $cli -ModelRef $cand.ref) { $build = $cand; break }
+        Write-Host "    [剔除] $($cand.ref) 不可用"
+    }
+    if (-not $build) { throw '所有候选 Build 模型均不可用（可能都受地区限制）。' }
+
+    # 8. 选择 Plan：按智能分降序，逐个探测，选第一个实际可用的
+    $plan = $null
+    $planSource = ''
+    $scored = @($rows | Where-Object { $null -ne $_.index } | Sort-Object @{ Expression = 'index'; Descending = $true }, total, input)
+    $planProbed = 0
+    foreach ($cand in $scored) {
+        if ($planProbed -ge 20) { break }
+        $planProbed++
+        if (Test-ModelAvailableCached -Cli $cli -ModelRef $cand.ref) {
+            $plan = $cand
+            $planSource = "AA Intelligence Index = $($cand.index)（$($cand.aaName)）"
+            break
+        }
+        Write-Host "    [剔除] $($cand.ref) 不可用（Plan）"
+    }
+    if (-not $plan) {
+        $plan = $build
+        $planSource = '回退：所有带智能分模型均不可用，沿用 Build 模型'
+    }
+
+    # 保存本次可用性探测结果（单文件按天覆盖）
+    if ($Script:AvailMap.Count -gt 0) {
+        Save-AvailabilityMap -CachePath $Script:AvailCachePath -Map $Script:AvailMap
     }
 
     # 8. 输出选择结果
@@ -324,9 +473,11 @@ try {
         Write-Host ''
         Write-Host '完成。配置已即时生效（若未生效，可在 OpenCode 中执行 /reload）。'
     }
+    Wait-Exit
 }
 catch {
     Write-Host ''
     Write-Error "脚本执行失败：$($_.Exception.Message)"
+    Wait-Exit
     exit 1
 }

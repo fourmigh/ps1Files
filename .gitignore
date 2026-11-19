@@ -13,3 +13,13 @@ Desktop.ini
 # 本地测试/调试产物
 test-output.json
 out.json
+
+# 会话历史修改前的备份（用于还原）
+session-msg-backup.json
+
+# 脚本运行产生的缓存（单文件、按天覆盖）
+aa-models-cache.json
+model-availability-cache.json
+
+# 数据库备份（改 session_v2 前的备份，体积大）
+opencode.db.bak-*
