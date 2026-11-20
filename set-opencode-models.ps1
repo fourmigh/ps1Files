@@ -145,68 +145,85 @@ function Get-OpenCodeModels {
 
 <#
     获取 Artificial Analysis 的模型智能分与价格（免费层，翻页取全量）。
-    按天缓存到 $CachePath：同一天命中缓存直接返回，跨天或 -Refresh 时重新拉取并覆盖。
+    缓存/回退策略：
+      1. 当天缓存命中 -> 直接用；
+      2. 否则调接口，成功则写当天缓存；
+      3. 接口失败但有历史缓存 -> 使用过期缓存（智能分变动不大）；
+      4. 接口失败且无任何缓存 -> 抛出错误（由上层回退）。
     返回 PSCustomObject 数组：slug / name / index / inputPrice / outputPrice
 #>
 function Get-AAData {
     param([string]$Key, [string]$CachePath, [switch]$Refresh)
     $today = Get-Date -Format 'yyyy-MM-dd'
 
+    # 1) 当天缓存
     if (-not $Refresh -and (Test-Path $CachePath)) {
         try {
             $cache = (Get-Content $CachePath -Raw -Encoding UTF8) | ConvertFrom-Json
             if ($cache.date -eq $today -and $cache.data -and @($cache.data).Count -gt 0) {
                 Write-Host "AA 缓存命中（$today），跳过接口调用"
                 return @($cache.data | ForEach-Object {
-                    [pscustomobject]@{
-                        slug = $_.slug; name = $_.name; index = $_.index
-                        inputPrice = $_.inputPrice; outputPrice = $_.outputPrice
-                    }
+                    [pscustomobject]@{ slug = $_.slug; name = $_.name; index = $_.index; inputPrice = $_.inputPrice; outputPrice = $_.outputPrice }
                 })
             }
-        } catch {
-            Write-Warning "AA 缓存读取失败，重新拉取：$($_.Exception.Message)"
-        }
+        } catch { }
     }
 
-    $headers = @{ 'x-api-key' = $Key }
-    $all = @()
-    $page = 1
-    $maxPage = 30   # 保险上限，避免死循环
-    do {
-        $url = "$Script:AA_BaseUrl`?page=$page"
-        $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 60
-        $json = $resp.Content | ConvertFrom-Json
-        foreach ($m in @($json.data)) {
-            $all += [pscustomobject]@{
-                slug       = $m.slug
-                name       = $m.name
-                index      = $m.evaluations.artificial_analysis_intelligence_index
-                inputPrice = $m.pricing.price_1m_input_tokens
-                outputPrice = $m.pricing.price_1m_output_tokens
-            }
-        }
-        $hasMore = [bool]$json.pagination.has_more
-        $page++
-    } while ($hasMore -and $page -le $maxPage)
-
-    # 写缓存（覆盖旧文件，单文件按天）
+    # 2) 调接口
     try {
-        $obj = [ordered]@{ date = $today; data = $all }
-        $jsonOut = $obj | ConvertTo-Json -Depth 10
-        [System.IO.File]::WriteAllText($CachePath, $jsonOut, (New-Object System.Text.UTF8Encoding($false)))
-        Write-Host "AA 数据已缓存（$today）"
+        $headers = @{ 'x-api-key' = $Key }
+        $all = @()
+        $page = 1
+        $maxPage = 30
+        do {
+            $url = "$Script:AA_BaseUrl`?page=$page"
+            $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -TimeoutSec 30
+            $json = $resp.Content | ConvertFrom-Json
+            foreach ($m in @($json.data)) {
+                $all += [pscustomobject]@{
+                    slug = $m.slug; name = $m.name
+                    index = $m.evaluations.artificial_analysis_intelligence_index
+                    inputPrice = $m.pricing.price_1m_input_tokens; outputPrice = $m.pricing.price_1m_output_tokens
+                }
+            }
+            $hasMore = [bool]$json.pagination.has_more
+            $page++
+        } while ($hasMore -and $page -le $maxPage)
+
+        try {
+            $obj = [ordered]@{ date = $today; data = $all }
+            [System.IO.File]::WriteAllText($CachePath, ($obj | ConvertTo-Json -Depth 10), (New-Object System.Text.UTF8Encoding($false)))
+            Write-Host "AA 数据已缓存（$today）"
+        } catch { Write-Warning "写 AA 缓存失败：$($_.Exception.Message)" }
+        return $all
     } catch {
-        Write-Warning "写 AA 缓存失败：$($_.Exception.Message)"
+        # 3) 接口失败 -> 使用过期缓存
+        if (Test-Path $CachePath) {
+            try {
+                $cache = (Get-Content $CachePath -Raw -Encoding UTF8) | ConvertFrom-Json
+                if ($cache.data -and @($cache.data).Count -gt 0) {
+                    Write-Warning "AA 接口不可用，改用过期缓存（日期 $($cache.date)）"
+                    return @($cache.data | ForEach-Object {
+                        [pscustomobject]@{ slug = $_.slug; name = $_.name; index = $_.index; inputPrice = $_.inputPrice; outputPrice = $_.outputPrice }
+                    })
+                }
+            } catch { }
+        }
+        # 4) 无任何缓存 -> 抛出
+        throw "AA 接口调用失败且无可用缓存：$($_.Exception.Message)"
     }
-    return $all
 }
 
 <#
-    实际探测模型是否可用：发一个最小请求（--archived 让探测会话不进列表）。
-    地区受限（not available in your country）或其他报错 => 不可用($false)；正常返回 => 可用($true)。
+    探测模型实际状态，返回字符串：
+      ok         正常可用
+      region     地区受限（not available in your country）
+      deprecated 已废弃 / 不再支持
+      limit      额度用完（周/日/月限额、配额、限流）
+      unknown    网络或其它临时失败（不判为不可用）
+    用 --archived 让探测会话不进会话列表。
 #>
-function Test-ModelAvailable {
+function Test-ModelStatus {
     param([string]$Cli, [string]$ModelRef)
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Cli
@@ -218,13 +235,18 @@ function Test-ModelAvailable {
     $stdout = $p.StandardOutput.ReadToEnd()
     $stderr = $p.StandardError.ReadToEnd()
     $p.WaitForExit()
-    # 退出码非 0 视为不可用（地区限制、已废弃、鉴权失败等都会导致非 0）
-    if ($p.ExitCode -ne 0) { return $false }
-    # 双保险：即便退出码为 0，出现以下关键字也判为不可用
     $combined = "$stdout`n$stderr"
-    if ($combined -match 'not available in your country') { return $false }
-    if ($combined -match '(?i)(deprecated|unauthor|forbidden|denied|no longer available|not supported)') { return $false }
-    return $true
+
+    if ($p.ExitCode -eq 0) {
+        if ($combined -match 'not available in your country') { return 'region' }
+        if ($combined -match '(?i)deprecated') { return 'deprecated' }
+        return 'ok'
+    }
+    # 非 0：区分模型级不可用 / 额度 / 其它临时失败
+    if ($combined -match 'not available in your country') { return 'region' }
+    if ($combined -match '(?i)(deprecated|no longer available|not supported)') { return 'deprecated' }
+    if ($combined -match '(?i)(usage limit|limit reached|quota|rate limit|too many requests|extra usage|daily.*limit|weekly.*limit|monthly.*limit)') { return 'limit' }
+    return 'unknown'
 }
 
 <# 读取可用性缓存（同一天才有效），返回 ref -> bool 的映射 #>
@@ -236,7 +258,7 @@ function Get-AvailabilityMap {
         try {
             $cache = (Get-Content $CachePath -Raw -Encoding UTF8) | ConvertFrom-Json
             if ($cache.date -eq $today -and $cache.availability) {
-                foreach ($p in $cache.availability.PSObject.Properties) { $map[$p.Name] = [bool]$p.Value }
+                foreach ($p in $cache.availability.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
             }
         } catch { }
     }
@@ -258,13 +280,13 @@ function Save-AvailabilityMap {
     }
 }
 
-<# 带缓存的可用性判断：命中内存缓存则直接用，否则实际探测并记录 #>
-function Test-ModelAvailableCached {
+<# 带缓存的状态判断：命中内存缓存则直接用，否则实际探测并记录（状态字符串） #>
+function Test-ModelStatusCached {
     param([string]$Cli, [string]$ModelRef)
     if ($Script:AvailMap.ContainsKey($ModelRef)) { return $Script:AvailMap[$ModelRef] }
-    $ok = Test-ModelAvailable -Cli $Cli -ModelRef $ModelRef
-    $Script:AvailMap[$ModelRef] = $ok
-    return $ok
+    $status = Test-ModelStatus -Cli $Cli -ModelRef $ModelRef
+    $Script:AvailMap[$ModelRef] = $status
+    return $status
 }
 
 <# 写配置：更新顶层 model、agents.plan.model 与 agents.build.model，保留其余字段 #>
@@ -414,37 +436,67 @@ try {
         if ($Script:AvailMap.Count -gt 0) { Write-Host "可用性缓存   : $($Script:AvailMap.Count) 条（当日）" }
     }
 
-    # 7. 选择 Build：排除 Free，按综合价升序，逐个探测实际可用性，选第一个可用的
+    # 7. 选择 Build：排除 Free，按综合价升序逐个探测（三态）；遇"额度用完"立即停止
     $buildPool = @($rows | Where-Object { $IncludeFree -or (-not $_.isFree) } | Sort-Object total, input)
     if ($buildPool.Count -eq 0) { throw '没有可用于 Build 的模型。' }
     $build = $null
-    $buildProbed = 0
+    $unknownFallback = $null
+    $limitHit = $false
     foreach ($cand in $buildPool) {
-        if ($buildProbed -ge 20) { break }
-        $buildProbed++
-        if (Test-ModelAvailableCached -Cli $cli -ModelRef $cand.ref) { $build = $cand; break }
-        Write-Host "    [剔除] $($cand.ref) 不可用"
+        $status = Test-ModelStatusCached -Cli $cli -ModelRef $cand.ref
+        if ($status -eq 'ok') { $build = $cand; break }
+        if ($status -eq 'limit') { $limitHit = $true; break }   # 额度是账户全局的，立即停止
+        if ($status -in @('region', 'deprecated')) {
+            Write-Host "    [剔除] $($cand.ref) 不可用（$status）"
+            continue
+        }
+        # unknown：限额外的临时失败（网络等），记为兜底，继续尝试更贵的
+        if (-not $unknownFallback) { $unknownFallback = $cand }
+        Write-Host "    [临时] $($cand.ref) 探测失败，暂列为兜底"
     }
-    if (-not $build) { throw '所有候选 Build 模型均不可用（可能都受地区限制）。' }
 
-    # 8. 选择 Plan：按智能分降序，逐个探测，选第一个实际可用的
+    if ($limitHit) {
+        Write-Host ''
+        Write-Host '=== 检测到额度用完 ==='
+        Write-Host 'OpenCode Go 周/日/月限额已用完，所有模型暂时都无法调用。'
+        Write-Host '无需重新选型（都用不了），保持现有配置不变；额度恢复后重跑本脚本即可。'
+        if ($Script:AvailMap.Count -gt 0) { Save-AvailabilityMap -CachePath $Script:AvailCachePath -Map $Script:AvailMap }
+        Wait-Exit
+        return
+    }
+
+    $buildFromFallback = $false
+    if (-not $build) {
+        if ($unknownFallback) { $build = $unknownFallback; $buildFromFallback = $true }
+    }
+    if (-not $build) { throw '所有候选 Build 模型均不可用（地区受限/已废弃）。' }
+
+    # 8. 选择 Plan：按智能分降序逐个探测（三态）
     $plan = $null
     $planSource = ''
+    $planUnknown = $null
     $scored = @($rows | Where-Object { $null -ne $_.index } | Sort-Object @{ Expression = 'index'; Descending = $true }, total, input)
-    $planProbed = 0
     foreach ($cand in $scored) {
-        if ($planProbed -ge 20) { break }
-        $planProbed++
-        if (Test-ModelAvailableCached -Cli $cli -ModelRef $cand.ref) {
+        $status = Test-ModelStatusCached -Cli $cli -ModelRef $cand.ref
+        if ($status -eq 'ok') {
             $plan = $cand
             $planSource = "AA Intelligence Index = $($cand.index)（$($cand.aaName)）"
             break
         }
-        Write-Host "    [剔除] $($cand.ref) 不可用（Plan）"
+        if ($status -eq 'limit') { break }   # 额度用完，下面回退
+        if ($status -in @('region', 'deprecated')) {
+            Write-Host "    [剔除] $($cand.ref) 不可用（$status）（Plan）"
+            continue
+        }
+        if (-not $planUnknown) { $planUnknown = $cand }
+    }
+    if (-not $plan -and $planUnknown) {
+        $plan = $planUnknown
+        $planSource = "AA Intelligence Index = $($plan.index)（$($plan.aaName)，临时兜底）"
     }
     if (-not $plan) {
         $plan = $build
-        $planSource = '回退：所有带智能分模型均不可用，沿用 Build 模型'
+        $planSource = '回退：所有带智能分模型均不可用/额度受限，沿用 Build 模型'
     }
 
     # 保存本次可用性探测结果（单文件按天覆盖）
@@ -457,6 +509,7 @@ try {
     Write-Host '=== 选择结果 ==='
     Write-Host "Build : $($build.ref)  综合价 $($build.total)  (in $($build.input) / out $($build.output))"
     if ($build.isFree) { Write-Host '        （免费模型）' }
+    if ($buildFromFallback) { Write-Host '        （注：该模型为临时探测失败兜底，额度恢复后即可用）' }
     Write-Host "Plan  : $($plan.ref)"
     Write-Host "        来源: $planSource"
     Write-Host "默认  : $($build.ref)   （新会话默认模型，与 Build 一致）"
@@ -477,7 +530,7 @@ try {
 }
 catch {
     Write-Host ''
-    Write-Error "脚本执行失败：$($_.Exception.Message)"
+    Write-Host "脚本执行失败：$($_.Exception.Message)" -ForegroundColor Red
     Wait-Exit
     exit 1
 }

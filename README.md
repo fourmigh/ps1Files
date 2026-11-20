@@ -70,12 +70,39 @@
 
 改动即时生效，无需重启；若未生效，在 OpenCode 里执行 `/reload`。
 
+## 切换运行中会话模型（命令 + 热键）
+
+> ⚠️ 配置选型只影响**新会话**。要切换**运行中/已有会话**的模型，必须通过 UI（输入框）操作：API 改后台会被会话活动覆盖、UI 下拉也不刷新。这里用 opencode 的**自定义命令** + AutoHotkey 热键来实现。
+
+**1. 命令文件**（放在全局命令目录 `F:\OpenCode\config\opencode\commands\`）：
+
+| 命令 | 作用 |
+| --- | --- |
+| `/build-economy` | 切到 Build + `deepseek-v4.1-flash-economy`（最省额度） |
+| `/plan-kimi` | 切到 Plan + `kimi-k3.1-pro`（较强） |
+
+命令用 frontmatter 指定 `agent` 和 `model`，运行命令即切换 agent + 模型并刷新输入框。想换模型，直接改文件里的 `model:` 即可。
+
+**2. 热键**（`opencode-model-hotkeys.ahk`，需安装 AutoHotkey v2）：
+
+- `Ctrl+Alt+B` → 向输入框发送 `/build-economy` + 回车
+- `Ctrl+Alt+P` → 向输入框发送 `/plan-kimi` + 回车
+
+双击 `.ahk` 加载脚本，在 OpenCode 窗口里按热键即可切换。
+
+**注意**：命令会提交一条极简 prompt（`OK`），所以每次切换会多一条回复、消耗极少量额度。
+
 ## 选择规则细节
 
 - **价格来源与口径**：通过 `opencode api get /api/model` 实时读取 OpenCode 自身的模型目录（底层来自 [models.dev](https://models.dev)，**每次运行实时查、不缓存**），取每个模型的 `cost[0]`（基础档），综合价 = `input + output`（单位 USD / 百万 token）。AA 接口返回的数据虽也含价格，但选最便宜时**只用 opencode 自己的标价**（即你在 opencode-go 里实际的计费标准）。
-- **可用性探测**：选模型前，逐个候选用 `opencode run --model <ref> --archived "Reply with OK"` 发一个最小请求；**退出码非 0**（地区受限、已废弃等）或命中关键字（`not available in your country`、`deprecated` 等）即剔除。`--archived` 让探测会话不进入会话列表。
-- **Build**：排除 Free（`input=0 且 output=0`）后，按综合价升序，取**第一个探测可用**的。
-- **Plan**：把模型名归一化（小写、去 `.`/`-`/空格）后匹配 AA 的 `slug`，按 `artificial_analysis_intelligence_index` 降序，取**第一个探测可用**的；匹配不到 AA 的跳过，全部不可用则沿用 Build。
+- **可用性探测（三态）**：选模型前用 `opencode run --model <ref> --archived "Reply with OK"` 探测（`--archived` 让探测会话不进列表），结果分五种：
+  - `ok` 可用；
+  - `region` 地区受限 / `deprecated` 已废弃 → **剔除**；
+  - `limit` 额度用完（周/日/月限额、配额、限流）→ **立即停止探测**；
+  - `unknown` 网络等临时失败 → 不剔除，作为兜底候选。
+- **Build**：排除 Free（`input=0 且 output=0`）后，按综合价升序，取**第一个 `ok`**；没有 `ok` 但有 `unknown` 时，用最便宜的 `unknown` 兜底。
+- **Plan**：把模型名归一化（小写、去 `.`/`-`/空格）后匹配 AA 的 `slug`，按 `artificial_analysis_intelligence_index` 降序取**第一个 `ok`**；无 `ok` 时用 `unknown` 兜底，再无则沿用 Build。
+- **额度用完（周/日/月限额）**：探测一旦遇到 `limit`，**立即停止**（额度是账户全局的，一个模型限额即全部限额），**不重新选型、不改配置**，只提示"额度已用完，恢复后重跑"，避免把"额度问题"误判成"模型不可用"。
 - **默认模型（顶层 `model`）**：等于 Build 选出的最省钱可用模型，决定新会话默认用哪个。
 - **免费模型**（`opencode/*` 等）在 AA 中通常无记录，因此不会参与 Plan 的"最强"竞争，符合预期。
 
@@ -90,6 +117,7 @@
 
 - 同一天内重复运行：直接命中缓存，不重复调接口、不重复探测。
 - 跨天自动失效并覆盖旧文件；文件损坏时自动重新拉取。
+- **AA 接口连不上**：若已有历史缓存（哪怕过期），会**改用过期缓存**（智能分变动不大）；连过期缓存都没有才回退 Plan。
 - 想当天强制刷新：加 `-RefreshAA` / `-RefreshAvail`。
 - 可用性探测每次发一个极小的模型请求，消耗极少 token；只有未命中缓存的候选才需要探测。
 
