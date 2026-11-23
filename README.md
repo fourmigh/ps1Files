@@ -2,6 +2,21 @@
 
 自动为 OpenCode 的 **plan**（规划）和 **build**（实现）两个内置 agent 选择最省钱的模型，并写入全局配置。
 
+> 本仓库把该脚本的全部文件集中在 `opencode-models/` 文件夹内，根目录只保留这份说明。
+
+## 目录结构
+
+```
+ps1Files/
+├── README.md                  # 本说明
+└── opencode-models/           # 脚本及相关文件
+    ├── set-opencode-models.ps1
+    ├── run.cmd
+    ├── .gitignore
+    ├── aa-models-cache.json
+    └── model-availability-cache.json
+```
+
 - **先剔除不可用，再选**：模型目录里的 `enabled/active` 不代表真能调用（存在地区受限、已废弃等"列表有、实际用不了"的情况），脚本会先发一个最小请求逐个探测，剔除不可用的，再在剩下的里面选。
 - **Build（实现）**：在付费模型里选**最便宜**的可用模型（默认排除 0 元 Free 模型）。
 - **Plan（规划）**：接入 [Artificial Analysis](https://artificialanalysis.ai) 的 **Intelligence Index**，选**智能分最高**的可用模型。
@@ -35,21 +50,23 @@
 
 ## 用法
 
+以下命令在**仓库根目录**执行（也可先 `cd opencode-models`，再用 `.\set-opencode-models.ps1`）：
+
 ```powershell
 # 预览选择结果（含探测剔除过程），不写配置
-.\set-opencode-models.ps1 -DryRun
+.\opencode-models\set-opencode-models.ps1 -DryRun
 
 # 正式选择：写配置（影响新会话）
-.\set-opencode-models.ps1
+.\opencode-models\set-opencode-models.ps1
 
 # 打印候选模型的价格 / 智能分全表（不做可用性探测，速度快）
-.\set-opencode-models.ps1 -ListAll
+.\opencode-models\set-opencode-models.ps1 -ListAll
 
 # 强制重新拉 AA 数据 / 重新探测可用性（默认当天内走缓存）
-.\set-opencode-models.ps1 -RefreshAA -RefreshAvail
+.\opencode-models\set-opencode-models.ps1 -RefreshAA -RefreshAvail
 ```
 
-> 双击运行请用 **`run.cmd`**：它会调用脚本并在结束后停留窗口，方便查看最终选择了哪些模型。脚本本身默认也会在"按回车键退出"处等待；命令行/自动化场景可加 `-NoPause` 跳过。
+> 双击运行请用 **`opencode-models\run.cmd`**：它会调用同目录脚本并在结束后停留窗口，方便查看最终选择了哪些模型。脚本本身默认也会在"按回车键退出"处等待；命令行/自动化场景可加 `-NoPause` 跳过。
 
 ### 参数
 
@@ -70,28 +87,6 @@
 
 改动即时生效，无需重启；若未生效，在 OpenCode 里执行 `/reload`。
 
-## 切换运行中会话模型（命令 + 热键）
-
-> ⚠️ 配置选型只影响**新会话**。要切换**运行中/已有会话**的模型，必须通过 UI（输入框）操作：API 改后台会被会话活动覆盖、UI 下拉也不刷新。这里用 opencode 的**自定义命令** + AutoHotkey 热键来实现。
-
-**1. 命令文件**（放在全局命令目录 `F:\OpenCode\config\opencode\commands\`）：
-
-| 命令 | 作用 |
-| --- | --- |
-| `/build-economy` | 切到 Build + `deepseek-v4.1-flash-economy`（最省额度） |
-| `/plan-kimi` | 切到 Plan + `kimi-k3.1-pro`（较强） |
-
-命令用 frontmatter 指定 `agent` 和 `model`，运行命令即切换 agent + 模型并刷新输入框。想换模型，直接改文件里的 `model:` 即可。
-
-**2. 热键**（`opencode-model-hotkeys.ahk`，需安装 AutoHotkey v2）：
-
-- `Ctrl+Alt+B` → 向输入框发送 `/build-economy` + 回车
-- `Ctrl+Alt+P` → 向输入框发送 `/plan-kimi` + 回车
-
-双击 `.ahk` 加载脚本，在 OpenCode 窗口里按热键即可切换。
-
-**注意**：命令会提交一条极简 prompt（`OK`），所以每次切换会多一条回复、消耗极少量额度。
-
 ## 选择规则细节
 
 - **价格来源与口径**：通过 `opencode api get /api/model` 实时读取 OpenCode 自身的模型目录（底层来自 [models.dev](https://models.dev)，**每次运行实时查、不缓存**），取每个模型的 `cost[0]`（基础档），综合价 = `input + output`（单位 USD / 百万 token）。AA 接口返回的数据虽也含价格，但选最便宜时**只用 opencode 自己的标价**（即你在 opencode-go 里实际的计费标准）。
@@ -108,7 +103,7 @@
 
 ## 缓存
 
-两个缓存文件都存放在**脚本目录**，均为**单文件、带日期、跨天自动覆盖**，**不会堆积、无需手动删除**：
+两个缓存文件都存放在**脚本目录**（`opencode-models\`），均为**单文件、带日期、跨天自动覆盖**，**不会堆积、无需手动删除**：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -125,5 +120,5 @@
 
 - 脚本用 UTF-8（带 BOM）保存，Windows PowerShell 5.1 下中文输出正常。
 - API key 只从环境变量或命令行读取，**不写入脚本、不进入仓库**。
-- 两个缓存文件与数据库备份已在 `.gitignore` 中忽略，不会被误提交。
+- 两个缓存文件与数据库备份已在 `opencode-models\.gitignore` 中忽略，不会被误提交。
 - 若配置文件为 JSONC（含注释），脚本解析失败时会重建该文件（仅保留 `$schema`、`model` 与 `agents`），请留意。
